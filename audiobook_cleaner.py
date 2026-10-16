@@ -13,11 +13,15 @@
 from __future__ import annotations
 
 import argparse
+import os
+import shutil
 import sys
 import subprocess
 import json
 import time
 import multiprocessing as mp
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
 from typing import Optional
 import logging
@@ -53,6 +57,16 @@ MODELS = {
     'roformer_denoise': 'denoise_mel_band_roformer_aufr33_sdr_27.9959.ckpt',
 }
 
+AUDIO_EXTENSIONS = ('.mp3', '.wav', '.flac', '.m4a', '.m4b', '.ogg', '.opus')
+
+# Второй шаг (шумоподавление) и его «чистый» стем
+DENOISE_MODEL = 'UVR-DeNoise.pth'
+DENOISE_CLEAN_STEM = 'No Noise'
+
+# Сепараторы с загруженными моделями: по одному на роль в каждом процессе,
+# чтобы модель не грузилась заново на каждую часть.
+_SEPARATORS: dict = {}
+
 
 def format_time(seconds: float) -> str:
     """Форматирует секунды в человекочитаемый вид."""
@@ -64,43 +78,36 @@ def format_time(seconds: float) -> str:
         return f"{seconds // 3600:.0f}ч {(seconds % 3600) // 60:.0f}м"
 
 
-def _process_chunk_worker(args: tuple) -> dict:
-    """
-    Воркер для параллельной обработки чанка.
-    Возвращает dict с результатами.
-    """
-    (
-        chunk_idx, chunk_path, chunk_output_dir,
-        model_name, denoise, use_gpu, sample_rate, segment_size
-    ) = args
-
+def _load_separator_class():
+    """Импортирует Separator, сохраняя настоящую причину ошибки импорта."""
     try:
         from audio_separator.separator import Separator
-    except ImportError:
-        return {'idx': chunk_idx, 'error': 'audio-separator not installed', 'vocals': [], 'instrumental': []}
+    except ImportError as e:
+        raise RuntimeError(
+            f"Не удалось импортировать audio-separator: {e}\n"
+            "Установите зависимости: pip install -r requirements.txt"
+        ) from e
+    return Separator
 
-    chunk_output_dir = Path(chunk_output_dir)
-    chunk_path = Path(chunk_path)
 
-    # Проверяем, обработан ли уже
-    if chunk_output_dir.exists():
-        existing = list(chunk_output_dir.glob("*Vocal*.wav"))
-        if existing:
-            vocals = [f.absolute() for f in chunk_output_dir.glob("*.wav")
-                      if 'vocal' in f.stem.lower() or 'no_noise' in f.stem.lower()]
-            instrumental = [f.absolute() for f in chunk_output_dir.glob("*.wav")
-                            if 'instrument' in f.stem.lower()]
-            return {'idx': chunk_idx, 'skipped': True, 'vocals': vocals, 'instrumental': instrumental}
+def _get_separator(role: str, model_name: str, output_dir: str, use_gpu: bool,
+                   sample_rate: int, segment_size: int, single_stem: Optional[str] = None):
+    """
+    Сепаратор с загруженной моделью, закэшированный на процесс.
 
-    chunk_output_dir.mkdir(exist_ok=True)
-
-    try:
-        # Создаём сепаратор для этого воркера
-        separator = Separator(
-            output_dir=str(chunk_output_dir),
+    output_dir задаётся только при создании: библиотека запоминает его
+    в экземпляре модели при load_model, поэтому менять его потом бесполезно.
+    """
+    key = (model_name, output_dir, use_gpu, sample_rate, segment_size, single_stem)
+    cached = _SEPARATORS.get(role)
+    if cached is None or cached[0] != key:
+        separator_cls = _load_separator_class()
+        separator = separator_cls(
+            output_dir=output_dir,
             output_format='wav',
             sample_rate=sample_rate,
             use_autocast=use_gpu,
+            output_single_stem=single_stem,
             mdx_params={
                 "hop_length": 1024,
                 "segment_size": segment_size,
@@ -110,48 +117,78 @@ def _process_chunk_worker(args: tuple) -> dict:
             }
         )
         separator.load_model(model_name)
+        _SEPARATORS[role] = (key, separator)
+    return _SEPARATORS[role][1]
 
-        result = separator.separate(str(chunk_path))
 
-        vocals = []
-        instrumental = []
-        vocals_file = None
+def _split_stems(model_name: str, model_instance) -> tuple:
+    """
+    Возвращает (стем с чистым голосом, остальное) для загруженной модели.
 
-        for f in result:
-            fp = Path(f)
-            if not fp.is_absolute():
-                fp = chunk_output_dir / fp.name
-            fp = fp.absolute()
+    Чистый голос — Vocals, dry или No <что-то> (No Noise, No Echo, No Reverb).
+    Имя файла не используется: в нём бывает имя модели вроде Kim_Vocal_2.
+    """
+    stems = (model_instance.primary_stem_name, model_instance.secondary_stem_name)
+    for i, stem in enumerate(stems):
+        name = stem.lower()
+        if name in ('vocals', 'dry') or name.startswith('no '):
+            return stem, stems[1 - i]
+    raise RuntimeError(
+        f"Модель {model_name}: не понимаю, какой из стемов {stems} содержит голос"
+    )
 
-            if 'vocal' in fp.stem.lower():
-                vocals_file = fp
-                vocals.append(fp)
-            elif 'instrument' in fp.stem.lower():
-                instrumental.append(fp)
 
-        # Denoise если нужно
-        if denoise and vocals_file:
-            denoise_separator = Separator(
-                output_dir=str(chunk_output_dir),
-                output_format='wav',
-                sample_rate=sample_rate,
-                use_autocast=use_gpu,
-            )
-            denoise_separator.load_model('UVR-DeNoise.pth')
-            denoised = denoise_separator.separate(str(vocals_file))
+def _require(path: Path) -> Path:
+    if not path.exists():
+        raise RuntimeError(f"audio-separator не создал {path.name} — смотрите его лог выше")
+    return path
 
-            for f in denoised:
-                fp = Path(f)
-                if not fp.is_absolute():
-                    fp = chunk_output_dir / fp.name
-                fp = fp.absolute()
-                if 'no_noise' in fp.stem.lower() or 'no noise' in fp.stem.lower():
-                    vocals.append(fp)
 
-        return {'idx': chunk_idx, 'vocals': vocals, 'instrumental': instrumental}
+def _process_chunk_worker(args: tuple) -> dict:
+    """
+    Обрабатывает одну часть. Используется и в параллельном,
+    и в последовательном режиме, и для файла без нарезки.
 
-    except Exception as e:
-        return {'idx': chunk_idx, 'error': str(e), 'vocals': [], 'instrumental': []}
+    Результаты: <name>.clean.wav (голос, после шумоподавления если включено)
+    и <name>.instrumental.wav. Часть считается готовой, когда есть clean.wav:
+    он появляется последним, переименованием.
+    """
+    (
+        chunk_idx, name, chunk_path, work_dir,
+        model_name, denoise, use_gpu, sample_rate, segment_size
+    ) = args
+
+    work_dir = Path(work_dir)
+    clean_path = work_dir / f"{name}.clean.wav"
+    if clean_path.exists():
+        return {'idx': chunk_idx, 'skipped': True}
+
+    try:
+        separator = _get_separator('main', model_name, str(work_dir),
+                                   use_gpu, sample_rate, segment_size)
+        voice_stem, rest_stem = _split_stems(model_name, separator.model_instance)
+        voice_path = work_dir / f"{name}.voice.wav"
+        inst_path = work_dir / f"{name}.instrumental.wav"
+        separator.separate(str(chunk_path), custom_output_names={
+            voice_stem: voice_path.stem,
+            rest_stem: inst_path.stem,
+        })
+        result_path = _require(voice_path)
+        _require(inst_path)
+
+        if denoise:
+            denoiser = _get_separator('denoise', DENOISE_MODEL, str(work_dir), use_gpu,
+                                      sample_rate, segment_size, single_stem=DENOISE_CLEAN_STEM)
+            denoised_path = work_dir / f"{name}.denoised.wav"
+            denoiser.separate(str(voice_path),
+                              custom_output_names={DENOISE_CLEAN_STEM: denoised_path.stem})
+            result_path = _require(denoised_path)
+
+        result_path.replace(clean_path)
+        return {'idx': chunk_idx}
+
+    except Exception as e:  # pylint: disable=broad-exception-caught
+        return {'idx': chunk_idx, 'error': str(e)}
 
 
 def get_audio_duration(file_path: str) -> float:
@@ -172,10 +209,12 @@ def get_audio_duration(file_path: str) -> float:
 
 
 def split_audio(input_file: str, output_dir: Path, chunk_duration: int) -> list[Path]:
-    """Нарезает аудиофайл на части указанной длительности."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    pattern = output_dir / "chunk_%04d.wav"
+    """
+    Нарезает аудиофайл на части указанной длительности.
 
+    Нарезка идёт во временную папку и переименовывается только целиком,
+    поэтому прерванный запуск не оставляет «готовую» неполную нарезку.
+    """
     # Проверяем, есть ли уже нарезанные чанки
     existing_chunks = sorted(output_dir.glob("chunk_*.wav"))
     if existing_chunks:
@@ -184,12 +223,18 @@ def split_audio(input_file: str, output_dir: Path, chunk_duration: int) -> list[
 
     logger.info(f"Нарезка на части по {chunk_duration} секунд...")
 
+    tmp_dir = output_dir.with_name(output_dir.name + '.tmp')
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    tmp_dir.mkdir(parents=True)
     subprocess.run([
         'ffmpeg', '-y', '-i', str(input_file),
         '-f', 'segment', '-segment_time', str(chunk_duration),
         '-c:a', 'pcm_s16le',
-        str(pattern)
+        str(tmp_dir / "chunk_%04d.wav")
     ], capture_output=True, check=True)
+    if output_dir.exists():
+        output_dir.rmdir()  # пустая: иначе вернули бы существующие части выше
+    tmp_dir.replace(output_dir)
 
     chunks = sorted(output_dir.glob("chunk_*.wav"))
     logger.info(f"Создано {len(chunks)} частей")
@@ -208,6 +253,8 @@ def concat_audio(input_files: list[Path], output_file: Path, output_format: str)
         for file in input_files:
             # Используем прямые слэши для совместимости с ffmpeg
             abs_path = str(file.absolute()).replace('\\', '/')
+            # Апостроф внутри '...' экранируется по правилам concat: ' → '\''
+            abs_path = abs_path.replace("'", "'\\''")
             f.write(f"file '{abs_path}'\n")
 
     logger.info(f"Склейка {len(input_files)} файлов...")
@@ -244,7 +291,7 @@ def clean_audiobook(
         use_gpu: bool = True,
         output_format: str = 'mp3',
         sample_rate: int = 44100,
-        segment_size: int = 64,
+        segment_size: int = 256,
         chunk_duration: int = 0,
         workers: int = 1,
 ) -> list[Path]:
@@ -255,21 +302,7 @@ def clean_audiobook(
     if not input_path.exists():
         raise FileNotFoundError(f"Файл не найден: {input_file}")
 
-    if chunk_duration > 0:
-        return clean_audiobook_chunked(
-            input_file=input_file,
-            output_dir=output_dir,
-            model_name=model_name,
-            denoise=denoise,
-            use_gpu=use_gpu,
-            output_format=output_format,
-            sample_rate=sample_rate,
-            segment_size=segment_size,
-            chunk_duration=chunk_duration,
-            workers=workers,
-        )
-
-    return _process_single_file(
+    return clean_audiobook_chunked(
         input_file=input_file,
         output_dir=output_dir,
         model_name=model_name,
@@ -278,7 +311,27 @@ def clean_audiobook(
         output_format=output_format,
         sample_rate=sample_rate,
         segment_size=segment_size,
+        chunk_duration=chunk_duration,
+        workers=workers,
     )
+
+
+def _run_parallel(tasks: list, workers: int):
+    """
+    Обрабатывает части в отдельных процессах, отдавая результаты по порядку.
+
+    spawn вместо fork: дочерние процессы не наследуют состояние torch/CUDA.
+    Если воркер умер (обычно OOM), ProcessPoolExecutor бросает
+    BrokenProcessPool — в отличие от mp.Pool, который ждёт вечно.
+    """
+    with ProcessPoolExecutor(max_workers=workers, mp_context=mp.get_context('spawn')) as pool:
+        try:
+            yield from pool.map(_process_chunk_worker, tasks)
+        except BrokenProcessPool:
+            logger.error(
+                "Процесс-воркер аварийно завершился — чаще всего из-за нехватки памяти. "
+                "Уменьшите --workers, --segment-size или --chunk-duration."
+            )
 
 
 def clean_audiobook_chunked(
@@ -289,13 +342,16 @@ def clean_audiobook_chunked(
         use_gpu: bool = True,
         output_format: str = 'mp3',
         sample_rate: int = 44100,
-        segment_size: int = 64,
+        segment_size: int = 256,
         chunk_duration: int = 600,
         workers: int = 1,
 ) -> list[Path]:
-    """Обрабатывает большой файл по частям с сохранением прогресса."""
+    """
+    Обрабатывает файл с сохранением прогресса: по частям или целиком
+    (chunk_duration=0). Повторный запуск пропускает готовые части.
+    """
 
-    # GPU + несколько процессов = OOM на одной карте и поломка CUDA после fork.
+    # GPU + несколько процессов = OOM на одной карте.
     if workers > 1 and use_gpu:
         logger.warning(
             "--workers > 1 несовместимо с GPU; переключаюсь на CPU. "
@@ -303,6 +359,13 @@ def clean_audiobook_chunked(
         )
         use_gpu = False
 
+    # Библиотека сама выбирает CUDA, если она видна, поэтому CPU — это
+    # скрыть видеокарту до импорта torch/onnxruntime (воркеры наследуют).
+    if not use_gpu:
+        os.environ['CUDA_VISIBLE_DEVICES'] = ''
+
+    _load_separator_class()  # понятная ошибка до нарезки, если пакет не импортируется
+
     input_path = Path(input_file)
 
     if output_dir is None:
@@ -310,311 +373,96 @@ def clean_audiobook_chunked(
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
 
-    # Директории для промежуточных файлов (сохраняются при падении)
-    chunks_dir = output_path / "_chunks"
-    processed_dir = output_path / "_processed"
-    chunks_dir.mkdir(exist_ok=True)
-    processed_dir.mkdir(exist_ok=True)
+    # Промежуточные файлы (сохраняются при падении). Папка результатов
+    # зависит от параметров, влияющих на результат, чтобы прогон с другой
+    # моделью не подхватил чужие части.
+    run_tag = f"{Path(model_name).stem}{'+denoise' if denoise else ''}_c{chunk_duration}"
+    work_dir = output_path / "_processed" / run_tag
+    work_dir.mkdir(parents=True, exist_ok=True)
 
     duration = get_audio_duration(input_file)
     logger.info(f"Входной файл: {input_path}")
     logger.info(f"Длительность: {duration / 60:.1f} минут")
-    logger.info(f"Режим: нарезка по {chunk_duration} секунд")
+    logger.info(f"Модель: {model_name}")
     logger.info(f"Промежуточные файлы: {output_path}")
-    if workers > 1:
-        logger.info(f"Параллельная обработка: {workers} воркеров")
 
-    # 1. Нарезаем на части
-    chunks = split_audio(input_file, chunks_dir, chunk_duration)
+    if chunk_duration > 0:
+        logger.info(f"Режим: нарезка по {chunk_duration} секунд")
+        chunks = split_audio(input_file, output_path / "_chunks" / f"c{chunk_duration}",
+                             chunk_duration)
+        if not chunks:
+            raise RuntimeError("Не удалось нарезать файл")
+        parts = [(chunk.stem, chunk) for chunk in chunks]
+    else:
+        parts = [("full", input_path)]
 
-    if not chunks:
-        logger.error("Не удалось нарезать файл")
-        return []
+    tasks = [
+        (i, name, str(path), str(work_dir),
+         model_name, denoise, use_gpu, sample_rate, segment_size)
+        for i, (name, path) in enumerate(parts, 1)
+    ]
+    total_chunks = len(tasks)
 
-    total_chunks = len(chunks)
-
-    # Подготовка задач
-    tasks = []
-    for i, chunk in enumerate(chunks, 1):
-        chunk_output_dir = processed_dir / f"chunk_{i:04d}"
-        tasks.append((
-            i, str(chunk), str(chunk_output_dir),
-            model_name, denoise, use_gpu, sample_rate, segment_size
-        ))
-
-    vocals_files = []
-    instrumental_files = []
     start_time = time.time()
     processed_count = 0
     skipped_count = 0
 
     if workers > 1:
-        # Параллельная обработка
-        logger.info(f"Запуск {workers} воркеров...")
-
-        with mp.Pool(processes=workers) as pool:
-            for result in pool.imap(_process_chunk_worker, tasks):
-                idx = result['idx']
-
-                if result.get('skipped'):
-                    logger.info(f"[{idx}/{total_chunks}] Пропущен (уже обработан)")
-                    skipped_count += 1
-                elif result.get('error'):
-                    logger.error(f"[{idx}/{total_chunks}] Ошибка: {result['error']}")
-                else:
-                    processed_count += 1
-                    elapsed = time.time() - start_time
-                    if processed_count > 0:
-                        avg_time = elapsed / processed_count
-                        remaining = avg_time * (total_chunks - processed_count - skipped_count)
-                        eta = format_time(remaining)
-                    else:
-                        eta = "..."
-                    logger.info(f"[{idx}/{total_chunks}] Готово | ETA: {eta}")
-
-                vocals_files.extend(result.get('vocals', []))
-                instrumental_files.extend(result.get('instrumental', []))
+        logger.info(f"Параллельная обработка: {workers} воркеров")
+        results = _run_parallel(tasks, workers)
     else:
-        # Последовательная обработка (оригинальная логика)
-        try:
-            from audio_separator.separator import Separator
-        except ImportError:
-            logger.error("Не установлен audio-separator!")
-            logger.error("Установите: pip install audio-separator[gpu]  # или [cpu]")
-            sys.exit(1)
+        results = map(_process_chunk_worker, tasks)
 
-        logger.info("Загрузка модели...")
-        separator = Separator(
-            output_dir=str(processed_dir),
-            output_format='wav',
-            sample_rate=sample_rate,
-            use_autocast=use_gpu,
-            mdx_params={
-                "hop_length": 1024,
-                "segment_size": segment_size,
-                "overlap": 0.25,
-                "batch_size": 1,
-                "enable_denoise": False,
-            }
-        )
-        separator.load_model(model_name)
+    for result in results:
+        idx = result['idx']
 
-        denoise_separator = None
-        if denoise:
-            denoise_separator = Separator(
-                output_dir=str(processed_dir),
-                output_format='wav',
-                sample_rate=sample_rate,
-                use_autocast=use_gpu,
-            )
-            denoise_separator.load_model('UVR-DeNoise.pth')
-
-        for i, chunk in enumerate(chunks, 1):
-            chunk_output_dir = processed_dir / f"chunk_{i:04d}"
-
-            existing_vocals = list(chunk_output_dir.glob("*Vocal*.wav")) if chunk_output_dir.exists() else []
-
-            if existing_vocals:
-                logger.info(f"[{i}/{total_chunks}] Пропуск (уже обработан): {chunk.name}")
-                for f in chunk_output_dir.glob("*.wav"):
-                    if 'vocal' in f.stem.lower() or 'no_noise' in f.stem.lower():
-                        vocals_files.append(f.absolute())
-                    elif 'instrument' in f.stem.lower():
-                        instrumental_files.append(f.absolute())
-                skipped_count += 1
-                continue
-
-            chunk_output_dir.mkdir(exist_ok=True)
-            chunk_start = time.time()
-
-            done = processed_count + skipped_count
-            if processed_count > 0:
-                elapsed = time.time() - start_time
-                avg_time = elapsed / processed_count
-                remaining = avg_time * (total_chunks - done)
-                eta = format_time(remaining)
-                speed = f"{avg_time:.1f}с/чанк"
-            else:
-                eta = "..."
-                speed = "..."
-
-            logger.info(f"\n[{i}/{total_chunks}] {chunk.name} | ETA: {eta} | {speed}")
-
-            try:
-                separator.output_dir = str(chunk_output_dir)
-                result = separator.separate(str(chunk))
-
-                vocals_file = None
-                for f in result:
-                    fp = Path(f)
-                    if not fp.is_absolute():
-                        fp = chunk_output_dir / fp.name
-                    fp = fp.absolute()
-
-                    if 'vocal' in fp.stem.lower():
-                        vocals_file = fp
-                        vocals_files.append(fp)
-                    elif 'instrument' in fp.stem.lower():
-                        instrumental_files.append(fp)
-
-                if denoise and denoise_separator and vocals_file:
-                    denoise_separator.output_dir = str(chunk_output_dir)
-                    denoised = denoise_separator.separate(str(vocals_file))
-                    for f in denoised:
-                        fp = Path(f)
-                        if not fp.is_absolute():
-                            fp = chunk_output_dir / fp.name
-                        fp = fp.absolute()
-                        if 'no_noise' in fp.stem.lower() or 'no noise' in fp.stem.lower():
-                            vocals_files.append(fp)
-
-                processed_count += 1
-                chunk_time = time.time() - chunk_start
-                logger.info(f"    Готово за {format_time(chunk_time)}")
-
-            except Exception as e:
-                logger.error(f"Ошибка при обработке части {i}: {e}")
-                continue
-
-    # 4. Склеиваем результаты
-    output_files = []
+        if result.get('skipped'):
+            logger.info(f"[{idx}/{total_chunks}] Пропущен (уже обработан)")
+            skipped_count += 1
+        elif result.get('error'):
+            logger.error(f"[{idx}/{total_chunks}] Ошибка: {result['error']}")
+        else:
+            processed_count += 1
+            elapsed = time.time() - start_time
+            avg_time = elapsed / processed_count
+            remaining = avg_time * (total_chunks - processed_count - skipped_count)
+            logger.info(f"[{idx}/{total_chunks}] Готово | ETA: {format_time(remaining)}")
 
     total_time = time.time() - start_time
     logger.info(f"\n{'=' * 50}")
     logger.info(f"Обработка завершена за {format_time(total_time)}")
     logger.info(f"Обработано: {processed_count}, пропущено: {skipped_count}")
-    logger.info(f"Склейка результатов...")
 
-    if vocals_files:
-        final_vocals = []
-        seen_chunks = set()
-        for f in reversed(vocals_files):
-            # Преобразуем в Path если это строка
-            if isinstance(f, str):
-                f = Path(f)
-            chunk_num = f.parent.name
-            if chunk_num not in seen_chunks:
-                seen_chunks.add(chunk_num)
-                final_vocals.append(f)
-        final_vocals.reverse()
+    # Готовность проверяем по диску, а не по результатам: так учитываются
+    # и упавшие части, и части, чей воркер умер.
+    missing = [idx for idx, name, *_ in tasks if not (work_dir / f"{name}.clean.wav").exists()]
+    if missing:
+        raise RuntimeError(
+            f"Не обработаны части {missing} из {total_chunks}. Склейка отменена, "
+            "чтобы в книге не было дыр. Перезапустите ту же команду — "
+            "готовые части будут пропущены."
+        )
 
-        final_vocals.sort(key=lambda x: x.parent.name)
+    logger.info("Склейка результатов...")
+    output_files = []
+    vocals_output = output_path / f"{input_path.stem}_(Vocals).{output_format}"
+    concat_audio([work_dir / f"{name}.clean.wav" for _, name, *_ in tasks],
+                 vocals_output, output_format)
+    output_files.append(vocals_output)
 
-        vocals_output = output_path / f"{input_path.stem}_(Vocals).{output_format}"
-        concat_audio(final_vocals, vocals_output, output_format)
-        output_files.append(vocals_output)
-
-    if instrumental_files:
-        # Преобразуем в Path если строки
-        instrumental_files = [Path(f) if isinstance(f, str) else f for f in instrumental_files]
-        instrumental_files.sort(key=lambda x: x.parent.name)
-        inst_output = output_path / f"{input_path.stem}_(Instrumental).{output_format}"
-        concat_audio(instrumental_files, inst_output, output_format)
-        output_files.append(inst_output)
+    inst_output = output_path / f"{input_path.stem}_(Instrumental).{output_format}"
+    concat_audio([work_dir / f"{name}.instrumental.wav" for _, name, *_ in tasks],
+                 inst_output, output_format)
+    output_files.append(inst_output)
 
     logger.info("\nГотово!")
-    logger.info(f"Результаты:")
+    logger.info("Результаты:")
     for f in output_files:
         size_mb = f.stat().st_size / (1024 * 1024)
         logger.info(f"  - {f} ({size_mb:.1f} MB)")
 
     logger.info(f"\nПромежуточные файлы сохранены в: {output_path}")
-    logger.info(f"Для очистки удалите папки _chunks и _processed")
-
-    return output_files
-
-
-def _process_single_file(
-        input_file: str,
-        output_dir: Optional[str] = None,
-        model_name: str = 'UVR-MDX-NET-Voc_FT.onnx',
-        denoise: bool = True,
-        use_gpu: bool = True,
-        output_format: str = 'mp3',
-        sample_rate: int = 44100,
-        segment_size: int = 64,
-) -> list[Path]:
-    """Обрабатывает один файл."""
-    try:
-        from audio_separator.separator import Separator
-    except ImportError:
-        logger.error("Не установлен audio-separator!")
-        logger.error("Установите: pip install audio-separator[gpu]  # или [cpu]")
-        sys.exit(1)
-
-    input_path = Path(input_file)
-    if not input_path.exists():
-        raise FileNotFoundError(f"Файл не найден: {input_file}")
-
-    if output_dir is None:
-        output_dir = input_path.parent / f"{input_path.stem}_cleaned"
-
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-
-    logger.info(f"Входной файл: {input_path}")
-    logger.info(f"Выходная директория: {output_path}")
-    logger.info(f"Модель: {model_name}")
-    logger.info(f"GPU: {'да' if use_gpu else 'нет'}")
-    logger.info(f"Размер сегмента: {segment_size} сек")
-
-    separator = Separator(
-        output_dir=str(output_path),
-        output_format=output_format,
-        sample_rate=sample_rate,
-        use_autocast=use_gpu,
-        mdx_params={
-            "hop_length": 1024,
-            "segment_size": segment_size,
-            "overlap": 0.25,
-            "batch_size": 1,
-            "enable_denoise": False,
-        }
-    )
-
-    output_files = []
-
-    logger.info("Шаг 1: Отделение голоса от фоновой музыки...")
-    separator.load_model(model_name)
-
-    try:
-        result = separator.separate(str(input_path))
-        logger.info(f"Результат сепарации: {result}")
-
-        for f in result:
-            output_files.append(Path(f))
-
-    except Exception as e:
-        logger.error(f"Ошибка при сепарации: {e}")
-        raise
-
-    if denoise and output_files:
-        logger.info("Шаг 2: Дополнительное шумоподавление...")
-
-        vocals_file = None
-        for f in output_files:
-            if 'vocal' in f.stem.lower() or 'voice' in f.stem.lower():
-                vocals_file = f
-                break
-
-        if vocals_file is None:
-            vocals_file = output_files[0]
-
-        try:
-            separator.load_model('UVR-DeNoise.pth')
-            denoised = separator.separate(str(vocals_file))
-            logger.info(f"Результат шумоподавления: {denoised}")
-
-            for f in denoised:
-                if Path(f) not in output_files:
-                    output_files.append(Path(f))
-
-        except Exception as e:
-            logger.warning(f"Шумоподавление не удалось: {e}")
-
-    logger.info("Готово!")
-    for f in output_files:
-        logger.info(f"  - {f}")
+    logger.info("Для очистки удалите папки _chunks и _processed")
 
     return output_files
 
@@ -622,7 +470,7 @@ def _process_single_file(
 def process_directory(
         input_dir: str,
         output_dir: Optional[str] = None,
-        extensions: tuple = ('.mp3', '.wav', '.flac', '.m4a', '.ogg', '.opus'),
+        extensions: tuple = AUDIO_EXTENSIONS,
         **kwargs
 ) -> dict[str, list[Path]]:
     """Обрабатывает все аудиофайлы в директории."""
@@ -631,6 +479,7 @@ def process_directory(
 
     audio_files = [f for f in input_path.iterdir()
                    if f.is_file() and f.suffix.lower() in extensions]
+    stems = [f.stem for f in audio_files]
 
     logger.info(f"Найдено {len(audio_files)} аудиофайлов")
 
@@ -638,19 +487,24 @@ def process_directory(
         logger.info(f"\n{'=' * 50}")
         logger.info(f"Обработка [{i}/{len(audio_files)}]: {audio_file.name}")
 
-        try:
-            file_output_dir = None
-            if output_dir:
-                file_output_dir = Path(output_dir) / audio_file.stem
+        # book.mp3 и book.flac не должны делить одну папку (и её прогресс)
+        name = audio_file.stem
+        if stems.count(name) > 1:
+            name = f"{name}_{audio_file.suffix.lstrip('.').lower()}"
+        if output_dir:
+            file_output_dir = Path(output_dir) / name
+        else:
+            file_output_dir = input_path / f"{name}_cleaned"
 
+        try:
             result = clean_audiobook(
                 str(audio_file),
-                output_dir=str(file_output_dir) if file_output_dir else None,
+                output_dir=str(file_output_dir),
                 **kwargs
             )
             results[str(audio_file)] = result
 
-        except Exception as e:
+        except Exception as e:  # pylint: disable=broad-exception-caught
             logger.error(f"Ошибка: {e}")
             results[str(audio_file)] = []
 
@@ -710,8 +564,9 @@ def main():
                         help='Формат выхода (default: mp3)')
     parser.add_argument('--sample-rate', '-sr', type=int, default=44100,
                         help='Sample rate (default: 44100)')
-    parser.add_argument('--segment-size', '-s', type=int, default=64,
-                        help='Размер сегмента в секундах (default: 64)')
+    parser.add_argument('--segment-size', '-s', type=int, default=256,
+                        help='Размер сегмента MDX-модели (default: 256; другое значение '
+                             'переводит ONNX-модель на более медленный PyTorch)')
     parser.add_argument('--chunk-duration', '-c', type=int, default=0,
                         help='Нарезать на части по N секунд (default: 0 = выкл)')
     parser.add_argument('--workers', '-w', type=int, default=1,
@@ -743,9 +598,17 @@ def main():
     }
 
     if args.dir:
-        process_directory(args.dir, output_dir=args.output, **common_args)
+        results = process_directory(args.dir, output_dir=args.output, **common_args)
+        failed = [f for f, outputs in results.items() if not outputs]
+        if failed:
+            logger.error(f"Не обработано файлов: {len(failed)} из {len(results)}")
+            sys.exit(1)
     else:
-        clean_audiobook(args.input, output_dir=args.output, **common_args)
+        try:
+            clean_audiobook(args.input, output_dir=args.output, **common_args)
+        except (RuntimeError, FileNotFoundError) as e:
+            logger.error(str(e))
+            sys.exit(1)
 
 
 if __name__ == '__main__':

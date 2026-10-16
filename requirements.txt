@@ -1,0 +1,5 @@
+# CPU-версия. Для NVIDIA GPU см. раздел «GPU Installation» в README.
+# Верхняя граница: API audio-separator меняется между минорными версиями.
+audio-separator[cpu]>=0.47,<0.48
+# audio-separator 0.47 импортирует audioread, но не ставит его сам
+audioread
