@@ -17,15 +17,18 @@ Python wrapper over [audio-separator](https://github.com/nomadkaraoke/python-aud
 - Automatic splitting of large files
 - Batch processing of directories
 - Works on CPU and GPU (NVIDIA CUDA)
-- Supported formats: MP3, WAV, FLAC, M4A, OGG, OPUS
+- Resume after interruption: finished parts are skipped on rerun
+- Supported formats: MP3, WAV, FLAC, M4A, M4B, OGG, OPUS
 
 ## Installation
 
 ### Basic Installation
 
 ```bash
-pip install audio-separator[cpu]
+pip install -r requirements.txt
 ```
+
+Requires Python 3.10+. `requirements.txt` pins the tested `audio-separator` version (CPU build).
 
 ### FFmpeg (required)
 
@@ -99,6 +102,8 @@ python audiobook_cleaner.py audiobook.mp3 --chunk-duration 600 --no-denoise
 
 The script will automatically split the file, process chunks, and merge the result.
 
+If the run is interrupted or some parts fail, the result is **not** merged (no gaps in the book) and the script exits with code 1. Run the same command again: finished parts are skipped. Changing `--model`, `--no-denoise` or `--chunk-duration` starts a separate set of parts.
+
 ### Model Selection
 
 ```bash
@@ -121,8 +126,9 @@ Arguments:
   --cpu                   Force CPU usage
   --format, -f            Output format: mp3, wav, flac (default: mp3)
   --sample-rate, -sr      Sample rate (default: 44100)
-  --segment-size, -s      Segment size in seconds (default: 64)
+  --segment-size, -s      MDX segment size (default: 256; other values make ONNX models run via slower PyTorch)
   --chunk-duration, -c    Split large files by N seconds (default: 0 = off)
+  --workers, -w           Parallel worker processes, CPU only (default: 1)
   --list-models, -l       Show available models
 ```
 
@@ -194,12 +200,12 @@ For 7-hour audiobook (85 chunks of 5 min):
 2. **Step 2** (optional): DeNoise model removes residual noise
 
 Output files:
-- `*_(Vocals).mp3` — clean narrator's voice
-- `*_(Instrumental).mp3` — separated music/noise
+- `*_(Vocals).mp3` — clean narrator's voice (after Step 2, if enabled)
+- `*_(Instrumental).mp3` — what was removed by Step 1 (music, or noise/echo for `denoise`/`dereverb` models)
 
 ## Requirements
 
-- Python 3.9+
+- Python 3.10+
 - FFmpeg
 - 8+ GB RAM (16 GB recommended for large files)
 - NVIDIA GPU with 4+ GB VRAM (optional, for acceleration)
@@ -212,6 +218,8 @@ Output files:
 # Use chunking + small segment size
 python audiobook_cleaner.py book.mp3 --chunk-duration 300 --segment-size 16 --no-denoise
 ```
+
+With `--workers N` every worker loads its own copy of the model: if a worker is killed for lack of memory, the script stops with an error instead of hanging. Reduce `--workers` or `--segment-size`.
 
 ### "Model file not found"
 
@@ -252,7 +260,7 @@ If you see in logs:
 Model converted from onnx to pytorch due to segment size not matching dim_t
 ```
 
-The model is being converted to PyTorch, which is slower. This is normal for some configurations.
+The model is being converted to PyTorch, which is slower. This happens when `--segment-size` differs from the model's native 256 (e.g. after lowering it to fit in memory).
 
 ## License
 
