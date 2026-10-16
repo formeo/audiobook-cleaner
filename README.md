@@ -1,5 +1,9 @@
 [![Pylint](https://github.com/formeo/audiobook-cleaner/actions/workflows/pylint.yml/badge.svg)](https://github.com/formeo/audiobook-cleaner/actions/workflows/pylint.yml)
 ![License](https://img.shields.io/badge/license-MIT-green)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/formeo/audiobook-cleaner/build.yml?branch=main&style=flat-square&label=Build)](https://github.com/formeo/audiobook-cleaner/actions)
+[![Latest Release](https://img.shields.io/github/v/release/formeo/audiobook-cleaner?style=flat-square)](https://github.com/formeo/audiobook-cleaner/releases)
+[![Language](https://img.shields.io/github/languages/top/formeo/audiobook-cleaner?style=flat-square)]()
+[![Downloads](https://img.shields.io/github/downloads/formeo/audiobook-cleaner/total?style=flat-square&label=Downloads)](https://github.com/formeo/audiobook-cleaner/releases)
 # Audiobook Cleaner
 
 Clean audiobooks from background music and noise using MDX-Net, VR, and Roformer neural network models.
