@@ -1,4 +1,7 @@
 """Регрессионные тесты на баги из ревью 2026-10-16 (нумерация как в ревью)."""
+# Хелперы тестов говорят сами за себя; фикстура fake_separator в аргументах
+# иногда нужна только ради подмены audio_separator.
+# pylint: disable=missing-function-docstring,unused-argument
 import os
 import subprocess
 import sys
@@ -7,8 +10,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-import audiobook_cleaner as ac
 from conftest import make_wav
+import audiobook_cleaner as ac
 
 DUR = 5.0      # секунд во входном файле
 CHUNK = 2      # нарезка по 2 с → 3 части
@@ -74,7 +77,7 @@ def test_resume_reuses_clean_parts_and_gives_same_file(tmp_path, fake_separator)
 
 
 def test_failed_part_aborts_instead_of_leaving_a_gap(tmp_path, fake_separator):
-    """#4: упавшая часть не даёт склеить книгу с дырой; после перезапуска досчитывается только она."""
+    """#4: упавшая часть не даёт склеить книгу с дырой; перезапуск досчитывает только её."""
     src = make_wav(tmp_path / 'book.wav', DUR)
     fake_separator.fail_on = 'chunk_0001'
     with pytest.raises(RuntimeError, match='[Нн]е обработан'):
@@ -206,3 +209,17 @@ def test_import_error_keeps_original_reason(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'audio_separator.separator', None)
     with pytest.raises(RuntimeError, match='audio_separator.separator'):
         run(make_wav(tmp_path / 'book.wav', DUR))
+
+
+# --- гигиена ----------------------------------------------------------------
+
+@pytest.mark.parametrize('missing', ['ffmpeg', 'ffprobe'])
+def test_missing_ffmpeg_is_reported_before_any_work(tmp_path, monkeypatch, fake_separator, missing):
+    """I6: без ffmpeg/ffprobe — понятная ошибка до нарезки, а не FileNotFoundError из subprocess."""
+    src = make_wav(tmp_path / 'book.wav', DUR)
+    real_which = ac.shutil.which
+    monkeypatch.setattr(ac.shutil, 'which', lambda cmd: None if cmd == missing else real_which(cmd))
+    with pytest.raises(RuntimeError, match=f'{missing}.*не найден'):
+        run(src)
+    assert not (tmp_path / 'book_cleaned').exists()
+    assert not fake_separator.calls

@@ -1,0 +1,6 @@
+[MESSAGES CONTROL]
+# logging-fstring-interpolation: f-строки в логах — осознанный стиль проекта.
+# import-outside-toplevel: audio-separator импортируется лениво, чтобы
+#   показать понятную ошибку и не тянуть torch в --list-models/--dry-run.
+disable=logging-fstring-interpolation,
+        import-outside-toplevel

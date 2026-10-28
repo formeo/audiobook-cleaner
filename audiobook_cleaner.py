@@ -72,10 +72,9 @@ def format_time(seconds: float) -> str:
     """Форматирует секунды в человекочитаемый вид."""
     if seconds < 60:
         return f"{seconds:.0f}с"
-    elif seconds < 3600:
+    if seconds < 3600:
         return f"{seconds // 60:.0f}м {seconds % 60:.0f}с"
-    else:
-        return f"{seconds // 3600:.0f}ч {(seconds % 3600) // 60:.0f}м"
+    return f"{seconds // 3600:.0f}ч {(seconds % 3600) // 60:.0f}м"
 
 
 def _load_separator_class():
@@ -136,6 +135,16 @@ def _split_stems(model_name: str, model_instance) -> tuple:
     raise RuntimeError(
         f"Модель {model_name}: не понимаю, какой из стемов {stems} содержит голос"
     )
+
+
+def _check_ffmpeg():
+    """Падает с понятной ошибкой, если ffmpeg или ffprobe не в PATH."""
+    for tool in ('ffmpeg', 'ffprobe'):
+        if shutil.which(tool) is None:
+            raise RuntimeError(
+                f"{tool} не найден в PATH. Установите FFmpeg (см. README): "
+                "winget install ffmpeg / sudo apt install ffmpeg / brew install ffmpeg"
+            )
 
 
 def _require(path: Path) -> Path:
@@ -273,7 +282,7 @@ def concat_audio(input_files: list[Path], output_file: Path, output_format: str)
         '-i', str(list_file.absolute()),
         *codec_args,
         str(output_file)
-    ], capture_output=True, text=True)
+    ], capture_output=True, text=True, check=False)  # код проверяем ниже, чтобы показать stderr
 
     if result.returncode != 0:
         logger.error(f"Ошибка ffmpeg: {result.stderr}")
@@ -364,7 +373,9 @@ def clean_audiobook_chunked(
     if not use_gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
-    _load_separator_class()  # понятная ошибка до нарезки, если пакет не импортируется
+    # Понятные ошибки до нарезки, если чего-то не хватает
+    _check_ffmpeg()
+    _load_separator_class()
 
     input_path = Path(input_file)
 
@@ -535,6 +546,7 @@ def list_models():
 
 
 def main():
+    """Точка входа CLI."""
     parser = argparse.ArgumentParser(
         description="Очистка аудиокниг от фоновой музыки и шумов",
         formatter_class=argparse.RawDescriptionHelpFormatter,
