@@ -2,9 +2,11 @@
 # Хелперы тестов говорят сами за себя; фикстура fake_separator в аргументах
 # иногда нужна только ради подмены audio_separator.
 # pylint: disable=missing-function-docstring,unused-argument
+import logging
 import os
 import subprocess
 import sys
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -223,3 +225,96 @@ def test_missing_ffmpeg_is_reported_before_any_work(tmp_path, monkeypatch, fake_
         run(src)
     assert not (tmp_path / 'book_cleaned').exists()
     assert not fake_separator.calls
+
+
+# --- нарезка по паузам и --dry-run -----------------------------------------
+
+def make_speech_with_pauses(path, seconds, pauses, sr=8000):
+    """
+    «Речь» (громкие тоны) поверх тихой «музыки», которая не прерывается.
+    В паузах речи остаётся только музыка — как в аудиокниге с фоном.
+    """
+    t = np.arange(int(seconds * sr)) / sr
+    music = 0.05 * np.sin(2 * np.pi * 110 * t)
+    speech = 0.5 * np.sin(2 * np.pi * 440 * t) * (0.6 + 0.4 * np.sin(2 * np.pi * 3 * t))
+    for start, end in pauses:
+        speech[(t >= start) & (t < end)] = 0
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    sf.write(str(path), music + speech, sr)
+    return path
+
+
+def chunk_bounds(tmp_path):
+    chunks = sorted((tmp_path / 'book_cleaned' / '_chunks' / f'c{CHUNK}').glob('chunk_*.wav'))
+    return np.cumsum([duration(c) for c in chunks])
+
+
+def test_parts_are_cut_in_speech_pauses_under_music(tmp_path):
+    """Граница части — в паузе речи рядом с целевой, даже когда под речью играет музыка."""
+    # паузы между фразами ~0.3 с: одна у края окна поиска, другая за целевой точкой
+    pauses = [(1.75, 2.05), (4.0, 4.3)]
+    src = make_speech_with_pauses(tmp_path / 'book.wav', DUR, pauses=pauses)
+    vocals = vocals_of(run(src, denoise=False))
+
+    bounds = chunk_bounds(tmp_path)
+    for bound, (start, end) in zip(bounds, pauses):
+        assert start + 0.05 < bound < end - 0.05
+    assert bounds[-1] == pytest.approx(DUR, abs=0.01)
+    assert duration(vocals) == pytest.approx(DUR, abs=0.01)
+
+
+def test_cut_stays_near_target_without_pauses(tmp_path):
+    """Без пауз граница остаётся в окне вокруг целевой точки, части не схлопываются."""
+    src = make_speech_with_pauses(tmp_path / 'book.wav', DUR, pauses=[])
+    run(src, denoise=False)
+    window = CHUNK * 0.1
+    bounds = chunk_bounds(tmp_path)
+    assert len(bounds) == 3
+    for k, bound in enumerate(bounds[:-1], 1):
+        assert abs(bound - k * CHUNK) <= window + 0.03
+
+
+def test_dry_run_writes_nothing_and_reports_plan(tmp_path, fake_separator, caplog):
+    caplog.set_level(logging.INFO)
+    src = make_wav(tmp_path / 'book.wav', DUR)
+    planned = run(src, dry_run=True)
+
+    assert [p.name for p in planned] == ['book_(Vocals).wav', 'book_(Instrumental).wav']
+    assert not (tmp_path / 'book_cleaned').exists()
+    assert not fake_separator.calls
+    assert 'Частей: 3' in caplog.text
+    assert 'Место на диске' in caplog.text
+
+
+def test_dry_run_shows_resume_progress(tmp_path, fake_separator, caplog):
+    caplog.set_level(logging.INFO)
+    src = make_wav(tmp_path / 'book.wav', DUR)
+    fake_separator.fail_on = 'chunk_0001'
+    with pytest.raises(RuntimeError):
+        run(src)
+    caplog.clear()
+    fake_separator.calls.clear()
+
+    run(src, dry_run=True)
+    assert 'готово 2' in caplog.text
+    assert not fake_separator.calls
+
+
+def test_dry_run_cli_for_directory_exits_zero(tmp_path, monkeypatch):
+    src_dir = tmp_path / 'in'
+    make_wav(src_dir / 'a.wav', DUR)
+    make_wav(src_dir / 'b.wav', DUR)
+    monkeypatch.setattr(sys, 'argv', ['audiobook_cleaner.py', '--dir', str(src_dir),
+                                      '-c', str(CHUNK), '--dry-run'])
+    ac.main()
+    assert sorted(p.name for p in src_dir.iterdir()) == ['a.wav', 'b.wav']
+
+
+def test_short_tail_is_merged_into_last_part(tmp_path):
+    """Хвост в доли секунды не становится отдельной частью: модель получила бы обрывок."""
+    src = make_wav(tmp_path / 'book.wav', 2 * CHUNK + 0.1)
+    vocals = vocals_of(run(src, denoise=False))
+    parts = np.diff(np.concatenate([[0], chunk_bounds(tmp_path)]))
+    assert len(parts) == 2 and parts.min() > CHUNK * 0.8
+    assert duration(vocals) == pytest.approx(2 * CHUNK + 0.1, abs=0.01)

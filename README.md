@@ -14,7 +14,7 @@ Python wrapper over [audio-separator](https://github.com/nomadkaraoke/python-aud
 - Separate narrator's voice from background music
 - Remove noise (hiss, hum, interference)
 - Remove echo and reverberation
-- Automatic splitting of large files
+- Automatic splitting of large files at pauses in speech (works under background music)
 - Batch processing of directories
 - Works on CPU and GPU (NVIDIA CUDA)
 - Resume after interruption: finished parts are skipped on rerun
@@ -100,7 +100,13 @@ python audiobook_cleaner.py audiobook.mp3 --chunk-duration 300 --no-denoise
 python audiobook_cleaner.py audiobook.mp3 --chunk-duration 600 --no-denoise
 ```
 
-The script will automatically split the file, process chunks, and merge the result.
+The script will automatically split the file, process chunks, and merge the result. Each boundary is placed at the quietest moment within ±10% of the target (at most ±10 s) — normally a pause between phrases, even when music plays underneath — so parts are cut between words, not in the middle of one.
+
+Check the plan before a long run: number of parts, progress of a previous run and the disk space needed. Nothing is written:
+
+```bash
+python audiobook_cleaner.py audiobook.mp3 --chunk-duration 300 --dry-run
+```
 
 If the run is interrupted or some parts fail, the result is **not** merged (no gaps in the book) and the script exits with code 1. Run the same command again: finished parts are skipped. Changing `--model`, `--no-denoise` or `--chunk-duration` starts a separate set of parts.
 
@@ -127,8 +133,9 @@ Arguments:
   --format, -f            Output format: mp3, wav, flac (default: mp3)
   --sample-rate, -sr      Sample rate (default: 44100)
   --segment-size, -s      MDX segment size (default: 256; other values make ONNX models run via slower PyTorch)
-  --chunk-duration, -c    Split large files by N seconds (default: 0 = off)
+  --chunk-duration, -c    Split large files into parts of about N seconds, at pauses (default: 0 = off)
   --workers, -w           Parallel worker processes, CPU only (default: 1)
+  --dry-run               Show the plan (parts, progress, disk space) without processing
   --list-models, -l       Show available models
 ```
 
