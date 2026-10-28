@@ -12,6 +12,8 @@
 Стемы — масштабированный вход, чтобы по громкости результата было видно,
 какой именно стем попал в итоговый файл.
 """
+# Фейки повторяют интерфейс библиотеки, а не документируют его.
+# pylint: disable=missing-function-docstring,missing-class-docstring,too-few-public-methods
 import sys
 import types
 from pathlib import Path

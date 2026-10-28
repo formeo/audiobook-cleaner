@@ -26,6 +26,8 @@ from pathlib import Path
 from typing import Optional
 import logging
 
+import numpy as np
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
@@ -72,10 +74,9 @@ def format_time(seconds: float) -> str:
     """Форматирует секунды в человекочитаемый вид."""
     if seconds < 60:
         return f"{seconds:.0f}с"
-    elif seconds < 3600:
+    if seconds < 3600:
         return f"{seconds // 60:.0f}м {seconds % 60:.0f}с"
-    else:
-        return f"{seconds // 3600:.0f}ч {(seconds % 3600) // 60:.0f}м"
+    return f"{seconds // 3600:.0f}ч {(seconds % 3600) // 60:.0f}м"
 
 
 def _load_separator_class():
@@ -136,6 +137,16 @@ def _split_stems(model_name: str, model_instance) -> tuple:
     raise RuntimeError(
         f"Модель {model_name}: не понимаю, какой из стемов {stems} содержит голос"
     )
+
+
+def _check_ffmpeg():
+    """Падает с понятной ошибкой, если ffmpeg или ffprobe не в PATH."""
+    for tool in ('ffmpeg', 'ffprobe'):
+        if shutil.which(tool) is None:
+            raise RuntimeError(
+                f"{tool} не найден в PATH. Установите FFmpeg (см. README): "
+                "winget install ffmpeg / sudo apt install ffmpeg / brew install ffmpeg"
+            )
 
 
 def _require(path: Path) -> Path:
@@ -208,9 +219,61 @@ def get_audio_duration(file_path: str) -> float:
         return 0
 
 
-def split_audio(input_file: str, output_dir: Path, chunk_duration: int) -> list[Path]:
+def _quietest_point(input_file: str, start: float, length: float) -> float:
     """
-    Нарезает аудиофайл на части указанной длительности.
+    Самая тихая точка в отрезке [start, start + length] — обычно пауза в речи.
+
+    Ищется минимум сглаженной громкости, а не тишина по порогу: под фоновой
+    музыкой настоящей тишины нет, но паузы речи остаются провалами громкости.
+    Декодируется только этот отрезок, а не весь файл.
+    """
+    rate, frame = 16000, 320            # кадры по 20 мс
+    smooth = 12                         # сглаживание ~250 мс: пауза, а не провал между слогами
+    # Захватываем по полокна сглаживания с краёв, чтобы кандидатами были
+    # все точки отрезка, включая края
+    pad = smooth * frame / rate / 2
+    origin = max(0.0, start - pad)
+    raw = subprocess.run([
+        'ffmpeg', '-v', 'error', '-ss', f'{origin:.3f}', '-t', f'{start + length + pad - origin:.3f}',
+        '-i', str(input_file), '-ac', '1', '-ar', str(rate), '-f', 's16le', '-'
+    ], capture_output=True, check=True).stdout
+    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32)
+    frames = len(samples) // frame
+    if frames < smooth:
+        return start + length / 2
+    energy = (samples[:frames * frame].reshape(frames, frame) ** 2).mean(axis=1)
+    # 'valid', а не 'same': дополнение нулями сделало бы края окна «тихими»
+    level = np.convolve(energy, np.ones(smooth) / smooth, mode='valid')
+    best = int(np.argmin(level)) + smooth / 2
+    return origin + best * frame / rate
+
+
+def _cut_targets(duration: float, chunk_duration: int) -> tuple[list[float], float]:
+    """
+    Целевые точки разреза k * chunk_duration и полуширина окна поиска паузы
+    (±10% длины части, не больше ±10 с). Части не короче 80% длины; точку,
+    после которой остался бы хвост короче окна, пропускаем — хвост
+    приклеивается к последней части, а не уходит в модель обрывком.
+    """
+    window = min(10.0, chunk_duration * 0.1)
+    targets = []
+    target = float(chunk_duration)
+    while target + 2 * window < duration:
+        targets.append(target)
+        target += chunk_duration
+    return targets, window
+
+
+def _cut_points(input_file: str, duration: float, chunk_duration: int) -> list[float]:
+    """Границы частей: самая тихая точка в окне вокруг каждой целевой."""
+    targets, window = _cut_targets(duration, chunk_duration)
+    return [_quietest_point(input_file, max(0.0, t - window), 2 * window) for t in targets]
+
+
+def split_audio(input_file: str, output_dir: Path, chunk_duration: int,
+                duration: float) -> list[Path]:
+    """
+    Нарезает аудиофайл на части около chunk_duration секунд, по паузам.
 
     Нарезка идёт во временную папку и переименовывается только целиком,
     поэтому прерванный запуск не оставляет «готовую» неполную нарезку.
@@ -221,14 +284,25 @@ def split_audio(input_file: str, output_dir: Path, chunk_duration: int) -> list[
         logger.info(f"Найдено {len(existing_chunks)} ранее нарезанных частей")
         return existing_chunks
 
-    logger.info(f"Нарезка на части по {chunk_duration} секунд...")
+    if duration > 0:
+        logger.info(f"Нарезка на части около {chunk_duration} секунд по паузам...")
+        cuts = _cut_points(input_file, duration, chunk_duration)
+        segment_args = ['-segment_times', ','.join(f'{c:.3f}' for c in cuts)] if cuts else []
+    else:
+        # Длительность неизвестна — паузы искать негде, режем ровно
+        logger.info(f"Нарезка на части по {chunk_duration} секунд...")
+        segment_args = ['-segment_time', str(chunk_duration)]
 
     tmp_dir = output_dir.with_name(output_dir.name + '.tmp')
     shutil.rmtree(tmp_dir, ignore_errors=True)
     tmp_dir.mkdir(parents=True)
     subprocess.run([
         'ffmpeg', '-y', '-i', str(input_file),
-        '-f', 'segment', '-segment_time', str(chunk_duration),
+        # segment режет только по границам пакетов (у WAV — 4096 сэмплов,
+        # до 93 мс при 44,1 кГц); мелкие пакеты дают точный разрез. p=0 — без
+        # дополнения тишиной.
+        '-af', 'asetnsamples=n=256:p=0',
+        '-f', 'segment', *segment_args,
         '-c:a', 'pcm_s16le',
         str(tmp_dir / "chunk_%04d.wav")
     ], capture_output=True, check=True)
@@ -273,7 +347,7 @@ def concat_audio(input_files: list[Path], output_file: Path, output_format: str)
         '-i', str(list_file.absolute()),
         *codec_args,
         str(output_file)
-    ], capture_output=True, text=True)
+    ], capture_output=True, text=True, check=False)  # код проверяем ниже, чтобы показать stderr
 
     if result.returncode != 0:
         logger.error(f"Ошибка ffmpeg: {result.stderr}")
@@ -294,9 +368,11 @@ def clean_audiobook(
         segment_size: int = 256,
         chunk_duration: int = 0,
         workers: int = 1,
+        dry_run: bool = False,
 ) -> list[Path]:
     """
     Очищает аудиокнигу от фоновой музыки и шумов.
+    С dry_run=True только показывает план и возвращает пути будущих файлов.
     """
     input_path = Path(input_file)
     if not input_path.exists():
@@ -313,7 +389,55 @@ def clean_audiobook(
         segment_size=segment_size,
         chunk_duration=chunk_duration,
         workers=workers,
+        dry_run=dry_run,
     )
+
+
+def _estimate_disk_bytes(duration: float, sample_rate: int, chunked: bool,
+                         denoise: bool, output_format: str) -> int:
+    """
+    Грубая оценка места на диске. Всё промежуточное — WAV 16 бит стерео:
+    нарезанные части (если режем) и на каждую часть voice + instrumental
+    (+ clean после шумоподавления; без него clean — переименованный voice).
+    Плюс итоговые файлы.
+    """
+    wav_copy = duration * sample_rate * 2 * 2
+    copies = (1 if chunked else 0) + (3 if denoise else 2)
+    final = {
+        'wav': 2 * wav_copy,
+        'flac': wav_copy,                 # два файла, каждый ~в 2 раза меньше WAV
+        'mp3': 2 * duration * 24_000,     # -q:a 2 ≈ 190 кбит/с
+    }[output_format]
+    return int(copies * wav_copy + final)
+
+
+def _format_size(size: float) -> str:
+    gib = 1024 ** 3
+    return f"{size / gib:.1f} ГБ" if size >= gib else f"{size / 1024 ** 2:.0f} МБ"
+
+
+def _log_dry_run(duration: float, chunk_duration: int, chunks_dir: Path,
+                 work_dir: Path, output_path: Path, needed_bytes: int):
+    """Печатает план прогона: части, прогресс прошлых запусков, место на диске."""
+    if chunk_duration <= 0:
+        names = ["full"]
+    elif chunks_dir.exists():
+        names = [c.stem for c in sorted(chunks_dir.glob("chunk_*.wav"))]
+    else:
+        names = []          # ещё не нарезано: границы определятся по паузам
+    total = len(names) or len(_cut_targets(duration, chunk_duration)[0]) + 1
+    done = sum((work_dir / f"{name}.clean.wav").exists() for name in names)
+    logger.info(f"Частей: {total}, готово {done}")
+
+    existing = output_path
+    while not existing.exists():
+        existing = existing.parent
+    free = shutil.disk_usage(existing).free
+    logger.info(f"Место на диске: нужно ≈{_format_size(needed_bytes)}, "
+                f"свободно {_format_size(free)}")
+    if needed_bytes > free:
+        logger.warning("Свободного места может не хватить")
+    logger.info("Пробный запуск (--dry-run): ничего не записано")
 
 
 def _run_parallel(tasks: list, workers: int):
@@ -345,6 +469,7 @@ def clean_audiobook_chunked(
         segment_size: int = 256,
         chunk_duration: int = 600,
         workers: int = 1,
+        dry_run: bool = False,
 ) -> list[Path]:
     """
     Обрабатывает файл с сохранением прогресса: по частям или целиком
@@ -364,21 +489,25 @@ def clean_audiobook_chunked(
     if not use_gpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = ''
 
-    _load_separator_class()  # понятная ошибка до нарезки, если пакет не импортируется
+    # Понятные ошибки до нарезки, если чего-то не хватает
+    _check_ffmpeg()
+    if not dry_run:
+        _load_separator_class()
 
     input_path = Path(input_file)
 
     if output_dir is None:
         output_dir = input_path.parent / f"{input_path.stem}_cleaned"
     output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
 
     # Промежуточные файлы (сохраняются при падении). Папка результатов
     # зависит от параметров, влияющих на результат, чтобы прогон с другой
     # моделью не подхватил чужие части.
     run_tag = f"{Path(model_name).stem}{'+denoise' if denoise else ''}_c{chunk_duration}"
     work_dir = output_path / "_processed" / run_tag
-    work_dir.mkdir(parents=True, exist_ok=True)
+    chunks_dir = output_path / "_chunks" / f"c{chunk_duration}"
+    vocals_output = output_path / f"{input_path.stem}_(Vocals).{output_format}"
+    inst_output = output_path / f"{input_path.stem}_(Instrumental).{output_format}"
 
     duration = get_audio_duration(input_file)
     logger.info(f"Входной файл: {input_path}")
@@ -386,10 +515,18 @@ def clean_audiobook_chunked(
     logger.info(f"Модель: {model_name}")
     logger.info(f"Промежуточные файлы: {output_path}")
 
+    if dry_run:
+        _log_dry_run(duration, chunk_duration, chunks_dir, work_dir, output_path,
+                     _estimate_disk_bytes(duration, sample_rate, chunk_duration > 0,
+                                          denoise, output_format))
+        return [vocals_output, inst_output]
+
+    output_path.mkdir(parents=True, exist_ok=True)
+    work_dir.mkdir(parents=True, exist_ok=True)
+
     if chunk_duration > 0:
-        logger.info(f"Режим: нарезка по {chunk_duration} секунд")
-        chunks = split_audio(input_file, output_path / "_chunks" / f"c{chunk_duration}",
-                             chunk_duration)
+        logger.info(f"Режим: нарезка около {chunk_duration} секунд")
+        chunks = split_audio(input_file, chunks_dir, chunk_duration, duration)
         if not chunks:
             raise RuntimeError("Не удалось нарезать файл")
         parts = [(chunk.stem, chunk) for chunk in chunks]
@@ -445,12 +582,10 @@ def clean_audiobook_chunked(
 
     logger.info("Склейка результатов...")
     output_files = []
-    vocals_output = output_path / f"{input_path.stem}_(Vocals).{output_format}"
     concat_audio([work_dir / f"{name}.clean.wav" for _, name, *_ in tasks],
                  vocals_output, output_format)
     output_files.append(vocals_output)
 
-    inst_output = output_path / f"{input_path.stem}_(Instrumental).{output_format}"
     concat_audio([work_dir / f"{name}.instrumental.wav" for _, name, *_ in tasks],
                  inst_output, output_format)
     output_files.append(inst_output)
@@ -535,6 +670,7 @@ def list_models():
 
 
 def main():
+    """Точка входа CLI."""
     parser = argparse.ArgumentParser(
         description="Очистка аудиокниг от фоновой музыки и шумов",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -571,6 +707,8 @@ def main():
                         help='Нарезать на части по N секунд (default: 0 = выкл)')
     parser.add_argument('--workers', '-w', type=int, default=1,
                         help='Количество параллельных воркеров для CPU (default: 1)')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Показать план (части, прогресс, место на диске) без обработки')
     parser.add_argument('--list-models', '-l', action='store_true',
                         help='Список моделей')
 
@@ -595,6 +733,7 @@ def main():
         'segment_size': args.segment_size,
         'chunk_duration': args.chunk_duration,
         'workers': args.workers,
+        'dry_run': args.dry_run,
     }
 
     if args.dir:
